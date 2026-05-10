@@ -157,7 +157,16 @@ not be displayed."
 ;;; Scroll Bar Thumb
 
 (defvar-local yascroll:thumb-overlays nil
-  "Overlays for scroll bar thum.")
+  "Alist mapping windows to their scroll bar overlays.")
+
+(defvar-local yascroll:buffer-line-count-cache nil
+  "Cached value for total line count in the current buffer.")
+
+(defvar-local yascroll:buffer-line-count-cache-tick nil
+  "Modification tick used by `yascroll:buffer-line-count-cache'.")
+
+(defconst yascroll:window-state-parameter 'yascroll:window-state
+  "Window parameter storing the last rendered scroll bar state.")
 
 (defun yascroll:compute-thumb-size (window-lines buffer-lines)
   "Return the proper size (height) of scroll bar thumb.
@@ -173,7 +182,24 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
       0
     (floor (* window-lines (/ (float scroll-top) buffer-lines)))))
 
-(defun yascroll:make-thumb-overlay-text-area ()
+(defun yascroll:get-window-thumb-overlays (window)
+  "Return overlays associated with WINDOW."
+  (alist-get window yascroll:thumb-overlays nil nil #'eq))
+
+(defun yascroll:set-window-thumb-overlays (window overlays)
+  "Store OVERLAYS for WINDOW."
+  (setf (alist-get window yascroll:thumb-overlays nil t #'eq) overlays))
+
+(defun yascroll:buffer-line-count ()
+  "Return total line count for the current buffer with caching."
+  (let ((tick (buffer-chars-modified-tick)))
+    (if (eq tick yascroll:buffer-line-count-cache-tick)
+        yascroll:buffer-line-count-cache
+      (setq yascroll:buffer-line-count-cache-tick tick
+            yascroll:buffer-line-count-cache
+            (count-lines (point-min) (point-max))))))
+
+(defun yascroll:make-thumb-overlay-text-area (window)
   "Not documented."
   (cl-destructuring-bind (edge-pos edge-padding)
       (yascroll:line-edge-position)
@@ -184,7 +210,7 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
                        (propertize " " 'face 'yascroll:thumb-text-area))))
           (put-text-property 0 1 'cursor t after-string)
           (overlay-put overlay 'after-string after-string)
-          (overlay-put overlay 'window (selected-window))
+          (overlay-put overlay 'window window)
           overlay)
       (let ((overlay (make-overlay edge-pos (1+ edge-pos)))
             (display-string
@@ -192,11 +218,11 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
                          'face 'yascroll:thumb-text-area
                          'cursor t)))
         (overlay-put overlay 'display display-string)
-        (overlay-put overlay 'window (selected-window))
+        (overlay-put overlay 'window window)
         (overlay-put overlay 'priority yascroll:priority)
         overlay))))
 
-(defun yascroll:make-thumb-overlay-fringe (left-or-right)
+(defun yascroll:make-thumb-overlay-fringe (left-or-right window)
   "Make thumb overlay on the LEFT-OR-RIGHT fringe."
   (let* ((pos (point))
          ;; If `pos' is at the beginning of line, overlay of the
@@ -207,19 +233,19 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
          (overlay (make-overlay pos pos)))
     (overlay-put overlay 'after-string after-string)
     (overlay-put overlay 'fringe-helper t)
-    (overlay-put overlay 'window (selected-window))
+    (overlay-put overlay 'window window)
     (overlay-put overlay 'priority yascroll:priority)
     overlay))
 
-(defun yascroll:make-thumb-overlay-left-fringe ()
+(defun yascroll:make-thumb-overlay-left-fringe (window)
   "Make thumb overlay on the left fringe."
-  (yascroll:make-thumb-overlay-fringe 'left-fringe))
+  (yascroll:make-thumb-overlay-fringe 'left-fringe window))
 
-(defun yascroll:make-thumb-overlay-right-fringe ()
+(defun yascroll:make-thumb-overlay-right-fringe (window)
   "Make thumb overlay on the right fringe."
-  (yascroll:make-thumb-overlay-fringe 'right-fringe))
+  (yascroll:make-thumb-overlay-fringe 'right-fringe window))
 
-(defun yascroll:make-thumb-overlays (make-thumb-overlay window-line size)
+(defun yascroll:make-thumb-overlays (make-thumb-overlay window window-line size)
   "Make overlays of scroll bar thumb (MAKE-THUMB-OVERLAY) at WINDOW-LINE with SIZE."
   (save-excursion
     ;; Jump to the line.
@@ -228,14 +254,22 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
     ;; Make thumb overlays.
     (condition-case nil
         (cl-loop repeat size
-                 do (push (funcall make-thumb-overlay) yascroll:thumb-overlays)
+                 collect (funcall make-thumb-overlay window) into overlays
                  until (zerop (vertical-motion 1)))
+      overlays
       (end-of-buffer nil))))
 
-(defun yascroll:delete-thumb-overlays ()
-  "Delete overlays of scroll bar thumb."
-  (when yascroll:thumb-overlays
-    (mapc 'delete-overlay yascroll:thumb-overlays)
+(defun yascroll:delete-thumb-overlays (&optional window)
+  "Delete overlays of scroll bar thumb.
+If WINDOW is non-nil, only remove overlays rendered for that window."
+  (if window
+      (when-let ((overlays (yascroll:get-window-thumb-overlays window)))
+        (mapc #'delete-overlay overlays)
+        (setq yascroll:thumb-overlays (assq-delete-all window yascroll:thumb-overlays))
+        (set-window-parameter window yascroll:window-state-parameter nil))
+    (dolist (entry yascroll:thumb-overlays)
+      (mapc #'delete-overlay (cdr entry))
+      (set-window-parameter (car entry) yascroll:window-state-parameter nil))
     (setq yascroll:thumb-overlays nil)))
 
 
@@ -245,10 +279,16 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
 (defvar-local yascroll:delay-timer nil
   "Delay timer.")
 
+(defun yascroll:cancel-hide-scroll-bar ()
+  "Cancel the pending idle timer used to hide the scroll bar."
+  (when (timerp yascroll:delay-timer)
+    (cancel-timer yascroll:delay-timer)
+    (setq yascroll:delay-timer nil)))
+
 (defun yascroll:schedule-hide-scroll-bar ()
   "Hide scroll bar automatically."
   (when yascroll:delay-to-hide
-    (when (timerp yascroll:delay-timer) (cancel-timer yascroll:delay-timer))
+    (yascroll:cancel-hide-scroll-bar)
     (setq yascroll:delay-timer
           (run-with-idle-timer yascroll:delay-to-hide nil
                                (lambda (buffer)
@@ -257,11 +297,11 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
                                      (yascroll:hide-scroll-bar))))
                                (current-buffer)))))
 
-(defun yascroll:choose-scroll-bar ()
+(defun yascroll:choose-scroll-bar (window)
   "Choose scroll bar by fringe position."
   (if (memq window-system yascroll:enabled-window-systems)
       (cl-destructuring-bind (left-width right-width outside-margins &rest _)
-          (window-fringes)
+          (window-fringes window)
         (cl-loop for scroll-bar in (yascroll:listify yascroll:scroll-bar)
                  if (or (eq scroll-bar 'text-area)
                         (and (eq scroll-bar 'left-fringe)
@@ -275,56 +315,103 @@ Doc-this WINDOW-LINES, BUFFER-LINES and SCROLL-TOP."
              window-system 'yascroll:enabled-window-systems yascroll:enabled-window-systems)
      :warning)))
 
-(defun yascroll:show-scroll-bar-internal ()
-  "Show scroll bar in buffer."
-  (when-let ((scroll-bar (yascroll:choose-scroll-bar)))
-    (let ((window-lines (yascroll:window-height))
-          (buffer-lines (count-lines (point-min) (point-max))))
+(defun yascroll:window-render-state (window)
+  "Return the last rendered state cached for WINDOW."
+  (window-parameter window yascroll:window-state-parameter))
+
+(defun yascroll:set-window-render-state (window state)
+  "Cache STATE for WINDOW."
+  (set-window-parameter window yascroll:window-state-parameter state))
+
+(defun yascroll:compute-window-render-state (window)
+  "Compute render state for WINDOW in the current buffer.
+Return nil when no scroll bar should be shown."
+  (when-let ((scroll-bar (yascroll:choose-scroll-bar window)))
+    (let ((window-lines (yascroll:window-height window))
+          (buffer-lines (yascroll:buffer-line-count)))
       (when (< window-lines buffer-lines)
         (let* ((scroll-top (count-lines (point-min) (window-start)))
                (thumb-window-line (yascroll:compute-thumb-window-line
                                    window-lines buffer-lines scroll-top))
                (thumb-buffer-line (+ scroll-top thumb-window-line))
                (thumb-size (yascroll:compute-thumb-size
-                            window-lines buffer-lines))
-               (make-thumb-overlay
-                (cl-ecase scroll-bar
-                  (left-fringe 'yascroll:make-thumb-overlay-left-fringe)
-                  (right-fringe 'yascroll:make-thumb-overlay-right-fringe)
-                  (text-area 'yascroll:make-thumb-overlay-text-area))))
+                            window-lines buffer-lines)))
           (when (<= thumb-buffer-line buffer-lines)
-            (yascroll:make-thumb-overlays make-thumb-overlay
-                                          thumb-window-line
-                                          thumb-size)
-            (yascroll:schedule-hide-scroll-bar)))))))
+            (list :scroll-bar scroll-bar
+                  :window-lines window-lines
+                  :buffer-lines buffer-lines
+                  :scroll-top scroll-top
+                  :thumb-window-line thumb-window-line
+                  :thumb-size thumb-size)))))))
+
+(defun yascroll:render-scroll-bar (window state)
+  "Render scroll bar for WINDOW from STATE."
+  (with-selected-window window
+    (let* ((scroll-bar (plist-get state :scroll-bar))
+           (thumb-window-line (plist-get state :thumb-window-line))
+           (thumb-size (plist-get state :thumb-size))
+           (make-thumb-overlay
+            (cl-ecase scroll-bar
+              (left-fringe #'yascroll:make-thumb-overlay-left-fringe)
+              (right-fringe #'yascroll:make-thumb-overlay-right-fringe)
+              (text-area #'yascroll:make-thumb-overlay-text-area))))
+      (yascroll:delete-thumb-overlays window)
+      (yascroll:set-window-thumb-overlays
+       window
+       (yascroll:make-thumb-overlays make-thumb-overlay
+                                     window
+                                     thumb-window-line
+                                     thumb-size))
+      (yascroll:set-window-render-state window state))))
+
+(defun yascroll:show-scroll-bar-in-window (window)
+  "Show scroll bar in WINDOW when needed."
+  (let ((state (yascroll:compute-window-render-state window)))
+    (cond
+     ((null state)
+      (yascroll:delete-thumb-overlays window))
+     ((equal state (yascroll:window-render-state window))
+      nil)
+     (t
+      (yascroll:render-scroll-bar window state)))))
+
+(defun yascroll:show-scroll-bars (&optional windows)
+  "Show scroll bars in WINDOWS.
+If WINDOWS is nil, update all windows displaying the current buffer."
+  (yascroll:with-no-redisplay
+    (dolist (win (or windows (get-buffer-window-list (current-buffer) nil t)))
+      (when (window-live-p win)
+        (yascroll:show-scroll-bar-in-window win))))
+  (yascroll:schedule-hide-scroll-bar))
 
 ;;;###autoload
 (defun yascroll:show-scroll-bar ()
   "Default key to show all scroll bars."
   (interactive)
-  (yascroll:with-no-redisplay
-    (yascroll:hide-scroll-bar)
-    (dolist (win (get-buffer-window-list (current-buffer) nil t))
-      (with-selected-window win
-        (yascroll:show-scroll-bar-internal)))))
+  (yascroll:show-scroll-bars))
 
-(defun yascroll:window-height ()
-  "`line-spacing'-aware calculation of `window-height'."
+(defun yascroll:window-height (&optional window)
+  "`line-spacing'-aware calculation of `window-height' for WINDOW."
   (if (and (fboundp 'window-pixel-height)
            (fboundp 'line-pixel-height)
            (display-graphic-p))
-      (/ (window-pixel-height) (line-pixel-height))
-    (window-height)))
+      (with-selected-window (or window (selected-window))
+        (/ (window-pixel-height window) (line-pixel-height)))
+    (window-height window)))
 
 ;;;###autoload
 (defun yascroll:hide-scroll-bar ()
   "Hide scroll bar of BUFFER."
   (interactive)
+  (yascroll:cancel-hide-scroll-bar)
   (yascroll:delete-thumb-overlays))
 
-(defun yascroll:scroll-bar-visible-p ()
-  "Return non-nil if scroll bar is visible."
-  (and yascroll:thumb-overlays t))
+(defun yascroll:scroll-bar-visible-p (&optional window)
+  "Return non-nil if scroll bar is visible.
+When WINDOW is non-nil, only inspect that window."
+  (if window
+      (and (yascroll:get-window-thumb-overlays window) t)
+    (and yascroll:thumb-overlays t)))
 
 (defun yascroll:handle-error (&optional var)
   "Handle errors, VAR."
@@ -341,7 +428,9 @@ in this function, this function will suppress the errors and disable \
 Optional argument WINDOW is the current targeted window; this is default
 to the selected window if the value is nil."
   (condition-case var
-      (with-selected-window (or window (selected-window))
+      (if window
+          (with-current-buffer (window-buffer window)
+            (yascroll:show-scroll-bars (list window)))
         (yascroll:show-scroll-bar))
     (error (yascroll:handle-error var))))
 
@@ -361,6 +450,7 @@ to the selected window if the value is nil."
 
 (defun yascroll:after-window-scroll (window start)
   "After WINDOW scrolls from START."
+  (ignore start)
   (yascroll:safe-show-scroll-bar window))
 
 (defun yascroll:after-window-configuration-change ()
